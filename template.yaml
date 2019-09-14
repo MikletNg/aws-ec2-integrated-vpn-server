@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+    - t2.nano
+    - t2.micro
+    - t2.small
+    - t2.medium
+    - t2.large
+    - t2.xlarge
+    - t2.2xlarge
+    - t3.nano
+    - t3.micro
+    - t3.small
+    - t3.medium
+    - t3.large
+    - t3.xlarge
+    - t3.2xlarge
+    ConstraintDescription: Must be a valid t2 or t3 EC2 instance type
+    Description: EC2 Instance Type
+  Password:
+    Type: String
+    Default: password
+  ShadowsocksEncryptionMethod:
+    Type: String
+    Default: chacha20-ietf-poly1305
+  ShadowsocksPort:
+    Type: Number
+    Default: 8888
+  kcptunPort:
+    Type: Number
+    Default: 8000
+
+Mappings:
+  RegionMap:
+    ap-southeast-1:
+      ImageId: ami-01f7527546b557442
+    ap-east-1:
+      ImageId: ami-570c7726
+    ap-northeast-1:
+      ImageId: ami-0c3fd0f5d33134a76
+
+Resources:
+  ##### S3 Bucket #####
+  S3Bucket:
+    Type: AWS::S3::Bucket
+      
+  S3BucketPolicy:
+    DependsOn:
+      - IPAddress
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${S3Bucket}/*
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${S3Bucket}/*
+            Condition:
+              IpAddress:
+                aws:SourceIp: !Sub ${IPAddress}/32
+      
+  ##### VPC #####
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 192.168.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      
+  ##### VPC - Internet Gateway #####
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+      
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+            
+  ##### VPC - Route Table #####
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: 
+      VpcId: !Ref VPC
+      
+  Route:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTable
+  
+  ##### VPC - Subnet #####
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '']
+      CidrBlock: 192.168.0.0/24
+      MapPublicIpOnLaunch: true
+      
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref Subnet
+      
+  ##### EC2 - Network Interface #####
+  NetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref Subnet
+      GroupSet: [!Ref SecurityGroup]
+      SourceDestCheck: true
+  
+  ##### EC2 - Elastic IP Address #####
+  IPAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: !Ref VPC
+      
+  IpAddressAssociate:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt IPAddress.AllocationId
+      NetworkInterfaceId: !Ref NetworkInterface
+      
+  ##### VPC - Security Group #####
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ShadowsocksR EC2 Instance Security Group
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: !Ref ShadowsocksPort
+        ToPort: !Ref ShadowsocksPort
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: udp
+        FromPort: !Ref kcptunPort
+        ToPort: !Ref kcptunPort
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: udp
+        FromPort: 500
+        ToPort: 500
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: udp
+        FromPort: 4500
+        ToPort: 4500
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 1723
+        ToPort: 1723
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: icmp
+        FromPort: 8
+        ToPort: -1
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: 47
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: 50
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: 51
+        CidrIp: 0.0.0.0/0
+      
+      VpcId: !Ref VPC
+  
+  # ##### EC2 - Instance #####
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', ImageId]
+      NetworkInterfaces:
+      - NetworkInterfaceId: !Ref NetworkInterface
+        DeviceIndex: 0
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+              # Update and Install Docker
+              yum update -y
+              amazon-linux-extras install docker -y
+              service docker start
+              usermod -a -G docker ec2-user
+              # Create environment file for IPSec and PPTP
+              cd ~
+              echo VPN_IPSEC_PSK=${IPAddress} >> ipsec.env
+              echo VPN_USER=${IPAddress} >> ipsec.env
+              echo VPN_PASSWORD=${Password} >> ipsec.env
+              echo '${IPAddress} * ${Password} *' >> chap-secrets
+              # Run Shadowsocks, kcptun, IPSec and PPTP
+              docker run --name ipsec --env-file ipsec.env --restart=always -p 500:500/udp -p 4500:4500/udp -d --privileged hwdsl2/ipsec-vpn-server
+              docker run -dt --name shadowsocks --restart=always -p ${ShadowsocksPort}:${ShadowsocksPort} -p ${kcptunPort}:${kcptunPort}/udp mritd/shadowsocks -m "ss-server" -s "-s 0.0.0.0 -p ${ShadowsocksPort} -m ${ShadowsocksEncryptionMethod} -k ${Password}" -x -e "kcpserver" -k "-t 127.0.0.1:${ShadowsocksPort} -l :${kcptunPort} -mode fast2"
+              docker run -d --name pptp --privileged --restart=always -p 1723:1723 -v $(pwd)/chap-secrets:/etc/ppp/chap-secrets mobtitude/vpn-pptp
+              # Upload the connection information and files to S3
+              mkdir lib && cd lib
+              URL=$(echo ${ShadowsocksEncryptionMethod}:${Password}@${IPAddress}:${ShadowsocksPort} | base64)
+              curl -o qr.png https://www.patrick-wied.at/static/qrgen/qrgen.php?content=ss://$URL#${IPAddress}
+              aws s3 cp . s3://${S3Bucket} --no-sign-request --recursive --region ${AWS::Region}
+              
+Outputs:
+  ShadowsocksUrl:
+    Value:
+      !Join
+      - ''
+      - - 'ss://'
+        - !Base64
+          "Fn::Sub": '${ShadowsocksEncryptionMethod}:${Password}@${IPAddress}:${ShadowsocksPort}'
+        - !Sub '#${IPAddress}'
+  
+  ShadowsocksQrCodeUrl:
+    Value:
+      !Join
+      - ''
+      - - 'https://'
+        - !GetAtt S3Bucket.RegionalDomainName
+        - '/qr.png'
+        
+  L2TPIPsecCredential:
+    Value:
+      !Join
+      - ' | '
+      - - !Sub 'PSK=${IPAddress}'
+        - !Sub 'Username=${IPAddress}'
+        - !Sub 'Password=${Password}'
+        
+  PPTPCredential:
+    Value:
+      !Join
+      - ' | '
+      - - !Sub 'Username=${IPAddress}'
+        - !Sub 'Password=${Password}'
